@@ -9,18 +9,26 @@ import datetime
 from argparse import ArgumentParser
 from argparse import BooleanOptionalAction
 
-from google.cloud import 
+from google.cloud import resourcemanager_v3 as resourcemanager
 
 def get_project_number():
-    projects_client = resourcemanager.ProjectsClient()
-    current_project = projects_client.get_project() 
-    return current_project.number
+    rm = resourcemanager.ProjectsClient()
+    project = rm.get_project(name="projects/55194013451")
+    # request = resourcemanager.GetProjectRequest(name="projects/vision-warehouse-pilot")
+    # project = projects_client.get_project(request=request)
+
+    print(project.name)
+    print(project.display_name)
+    print(project.project_id)
+
+    return project
 
 def main(args):
     yay = "Yes!"
     print(f"You made it inside. {yay}")
 
     PROJECT_NUMBER_STR = get_project_number()
+    exit()
     PROJECT_NUMBER = int(PROJECT_NUMBER_STR[0])
 
     # Only us-central1 is supported.
