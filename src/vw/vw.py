@@ -13,9 +13,9 @@ from visionai.python.warehouse.transformer import asset_indexing_transformer as 
 from visionai.python.warehouse.transformer import (ocr_transformer, speech_transformer, transformer_factory)
 from visionai.python.warehouse.utils import (vod_asset, vod_corpus, vod_index_endpoint)
 
-def get_project_number():
+def get_project_number(name: str) -> str:
     rm = resourcemanager.ProjectsClient()
-    project = rm.get_project(name="projects/vision-warehouse-pilot")
+    project = rm.get_project(name=f"projects/{name}")
 
     # name comes back as "projects/5519466666", we only want to return the number
     return project.name.split('/')[1]
@@ -24,7 +24,7 @@ def main(args):
 
     ##########
     # Define CONSTANTS
-    PROJECT_NUMBER_STR = get_project_number()
+    PROJECT_NUMBER_STR = get_project_number(args.project)
     
     # This was the original line, not sure why they took only the first number of the project number
     # PROJECT_NUMBER = int(PROJECT_NUMBER_STR[0])
@@ -75,11 +75,20 @@ def main(args):
 
     ##########
     # Set up logging
-    logging.basicConfig()
-    logging.getLogger().setLevel(logging.INFO)
-    _logger = logging.getLogger("vw-examples")
+    _logger = logging.getLogger(__name__)
+    _logger.setLevel(logging.DEBUG)
 
+    # Create a console handler
+    handler = logging.StreamHandler()
+
+    # Set the log format
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+
+    # Add the handler to the logger
+    _logger.addHandler(handler)
     
+
 
     ##########
     # Create a warehouse client
@@ -306,6 +315,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Vision Warehouse Asset Ingest")
+    parser.add_argument("--project", type=str, help="The Google Cloud project to use", default=os.getenv("GOOGLE_CLOUD_PROJECT", "vision-warehouse-pilot"))
     parser.add_argument("--corpus", type=str, help="The name of the Corpus to create", default=os.getenv("VW_CORPUS_NAME", "my_vw_corpus_name"))
     parser.add_argument("--corpus-desc", type=str, help="A description of this Corpus", default=os.getenv("VW_CORPUS_DESC", "This is my VW Corpus"))
     parser.add_argument("--index", type=str, help="The name of the Index to create", default=os.getenv("VW_INDEX_NAME", "my_vw_index"))
