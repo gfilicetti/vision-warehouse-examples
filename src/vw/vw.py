@@ -92,6 +92,7 @@ def main(args):
 
     ##########
     # Create a warehouse client
+    _logger.info("Create a warehouse client")
     warehouse_endpoint = channel.get_warehouse_service_endpoint(channel.Environment[ENV])
     warehouse_client = visionai_v1.WarehouseClient(
         client_options={"api_endpoint": warehouse_endpoint}
@@ -102,6 +103,7 @@ def main(args):
     ##########
     # Create or reuse a Corpus
     if CORPUS_ID is None:
+        _logger.info(f"Create a net new corpus: {CORPUS_DISPLAY_NAME}")
         corpus_name = vod_corpus.create_corpus(
             warehouse_client,
             PROJECT_NUMBER,
@@ -113,11 +115,13 @@ def main(args):
         corpus_name = visionai_v1.WarehouseClient.corpus_path(
             PROJECT_NUMBER_STR, REGION, CORPUS_ID
         )
+        _logger.info(f"Using a preexisting corpus: {corpus_name}")
 
     
 
     ##########
     # Create an executor to upload and transform assets in parallel.
+    _logger.info("Create an executor for asset uploading")
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
     
@@ -152,12 +156,14 @@ def main(args):
     # Create index and index endpoint for the corpus, or use existing index
     # and index endpoint if specified.
     if DEPLOYED_INDEX_ID is None:
+        _logger.info(f"Creating a net new index: {INDEX_DISPLAY_NAME}")
         # Creates index for the corpus.
         index_name = vod_corpus.index_corpus(
             warehouse_client, corpus_name, INDEX_DISPLAY_NAME
         )
         # Creates index endpoint and deploys the created index above to the index
         # endpoint.
+        _logger.info(f"Creating a net new index endpoint: {INDEX_ENDPOINT_DISPLAY_NAME}")
         index_endpoint_name = vod_index_endpoint.create_index_endpoint(
             warehouse_client,
             PROJECT_NUMBER,
@@ -178,6 +184,7 @@ def main(args):
         deploy_operation.result(timeout=7200)
         _logger.info("Index is deployed.")
     else:
+        _logger.info(f"Using an existing index, id: {DEPLOYED_INDEX_ID}")
         index_name = "{}/indexes/{}".format(corpus_name, DEPLOYED_INDEX_ID)
         index = warehouse_client.get_index(visionai_v1.GetIndexRequest(name=index_name))
         _logger.info("Use existing index %s.", index)
@@ -191,6 +198,7 @@ def main(args):
 
     ##########
     # Run Transforms
+    _logger.info(f"Run transforms")
     ocr_config = ocr_transformer.OcrTransformerInitConfig(
         corpus_name=corpus_name,
         env=channel.Environment[ENV],
@@ -227,8 +235,6 @@ def main(args):
         except Exception as e:
             _logger.exception(e)
 
-    # GF: this is the original line and 3.12 complains about the + operator. 
-    # GF: I'm going to try and just make a list of them
     all_transformers = ml_transformers + [asset_indexing_transformer] # type: ignore
     for transformer in all_transformers:
         transformer.teardown()
@@ -237,10 +243,12 @@ def main(args):
 
     ##########
     # Execute a search for: "dinosaur"
+    search_term = "dinosaur"
+    _logger.info(f"Execute a search for: {search_term}")
     search_response = warehouse_client.search_index_endpoint(
         visionai_v1.SearchIndexEndpointRequest(
             index_endpoint=index_endpoint_name,
-            text_query="dinosaur",
+            text_query=search_term,
             page_size=10,
         )
     )
@@ -250,13 +258,15 @@ def main(args):
 
     ##########
     # Execute a search with Criteria for "river"
+    search_criteria = "river"
+    _logger.info(f"Execute a search with Criteria: {search_criteria}")
     cr = visionai_v1.Criteria(
         field="speech", text_array=visionai_v1.StringArray(txt_values=["kid"])
     )
     search_response = warehouse_client.search_index_endpoint(
         visionai_v1.SearchIndexEndpointRequest(
             index_endpoint=index_endpoint_name,
-            text_query="river",
+            text_query=search_criteria,
             criteria=[cr],
             page_size=100,
         )
@@ -267,13 +277,15 @@ def main(args):
 
     ##########
     # Execute another search with Criteria for "trees"
+    search_criteria = "trees"
+    _logger.info(f"Execute a search with Criteria: {search_criteria}")
     cr = visionai_v1.Criteria(
         field="text", text_array=visionai_v1.StringArray(txt_values=["National Park"])
     )
     search_response = warehouse_client.search_index_endpoint(
         visionai_v1.SearchIndexEndpointRequest(
             index_endpoint=index_endpoint_name,
-            text_query="trees",
+            text_query=search_criteria,
             criteria=[cr],
             page_size=100,
         )
@@ -284,12 +296,15 @@ def main(args):
 
     ##########
     # Perform clean up if requested
+    _logger.info(f"Perform clean up if requested")
     if CLEAN_UP_ASSETS:
+        _logger.info(f"Cleaning assets")
         for asset_name in asset_names:
             warehouse_client.delete_asset(visionai_v1.DeleteAssetRequest(name=asset_name))
             _logger.info("Deleted asset %s", asset_name)
 
     if CLEAN_UP_INDEX:
+        _logger.info(f"Cleaning indices")
         undeploy_operation = warehouse_client.undeploy_index(
             visionai_v1.UndeployIndexRequest(index_endpoint=index_endpoint_name)
         )
@@ -308,6 +323,7 @@ def main(args):
         _logger.info("Deleted index endpoint %s", index_endpoint_name)
 
     if CLEAN_UP_CORPUS:
+        _logger.info(f"Cleaning corpus")
         warehouse_client.delete_corpus(visionai_v1.DeleteCorpusRequest(name=corpus_name))
         _logger.info("Deleted corpus %s", corpus_name)
 
