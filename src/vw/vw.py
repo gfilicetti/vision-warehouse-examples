@@ -229,8 +229,7 @@ def main(args):
 
     # GF: this is the original line and 3.12 complains about the + operator. 
     # GF: I'm going to try and just make a list of them
-    # all_transformers = ml_transformers + [asset_indexing_transformer]
-    all_transformers = [ml_transformers, asset_indexing_transformer]
+    all_transformers = ml_transformers + [asset_indexing_transformer] # type: ignore
     for transformer in all_transformers:
         transformer.teardown()
 
