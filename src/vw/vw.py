@@ -20,6 +20,175 @@ def get_project_number(name: str) -> str:
     # name comes back as "projects/5519466666", we only want to return the number
     return project.name.split('/')[1]
 
+def cleanup(CLEAN_UP_ASSETS, CLEAN_UP_INDEX, CLEAN_UP_CORPUS, _logger, warehouse_client, corpus_name, asset_names, index_name, index_endpoint_name):
+    _logger.info(f"Perform clean up if requested")
+    if CLEAN_UP_ASSETS:
+        _logger.info(f"Cleaning assets")
+        for asset_name in asset_names:
+            warehouse_client.delete_asset(visionai_v1.DeleteAssetRequest(name=asset_name))
+            _logger.info("Deleted asset %s", asset_name)
+
+    if CLEAN_UP_INDEX:
+        _logger.info(f"Cleaning indices")
+        undeploy_operation = warehouse_client.undeploy_index(
+            visionai_v1.UndeployIndexRequest(index_endpoint=index_endpoint_name)
+        )
+        _logger.info(
+            "Wait for index to be undeployed %s.",
+            undeploy_operation.operation.name,
+        )
+        # Wait for the undeploy index operation.
+        undeploy_operation.result(timeout=1800)
+        _logger.info("Index is undeployed.")
+        warehouse_client.delete_index(visionai_v1.DeleteIndexRequest(name=index_name))
+        _logger.info("Deleted index %s", index_name)
+        warehouse_client.delete_index_endpoint(
+            visionai_v1.DeleteIndexEndpointRequest(name=index_endpoint_name)
+        )
+        _logger.info("Deleted index endpoint %s", index_endpoint_name)
+
+    if CLEAN_UP_CORPUS:
+        _logger.info(f"Cleaning corpus")
+        warehouse_client.delete_corpus(visionai_v1.DeleteCorpusRequest(name=corpus_name))
+        _logger.info("Deleted corpus %s", corpus_name)
+
+def run_transforms(ENV, _logger, warehouse_client, corpus_name, executor, asset_names, index_name):
+    _logger.info(f"Run transforms")
+    ocr_config = ocr_transformer.OcrTransformerInitConfig(
+        corpus_name=corpus_name,
+        env=channel.Environment[ENV],
+    )
+
+    ml_config = transformer_factory.MlTransformersCreationConfig(
+        run_embedding=True,
+        speech_transformer_init_config=speech_transformer.SpeechTransformerInitConfig(
+            corpus_name=corpus_name, language_code="en-US"
+        ),
+        ocr_transformer_init_config=ocr_config,
+    )
+    ml_transformers = transformer_factory.create_ml_transformers(
+        warehouse_client, ml_config
+    )
+    # Creates indexing transformer to index assets.
+    asset_indexing_transformer = ait.AssetIndexingTransformer(warehouse_client, index_name)
+    # Runs the transformers for the assets.
+    futures = []
+
+    for asset_name in asset_names:
+        futures.append(
+            executor.submit(
+                vod_asset.transform_single_asset,
+                asset_name,
+                ml_transformers,
+                asset_indexing_transformer,
+            )
+        )
+    done_or_error, _ = concurrent.futures.wait(futures, return_when="ALL_COMPLETED")
+    for future in done_or_error:
+        try:
+            future.result()
+        except Exception as e:
+            _logger.exception(e)
+
+    all_transformers = ml_transformers + [asset_indexing_transformer] # type: ignore
+    for transformer in all_transformers:
+        transformer.teardown()
+
+def create_index(PROJECT_NUMBER, REGION, INDEX_DISPLAY_NAME, INDEX_ENDPOINT_DISPLAY_NAME, DEPLOYED_INDEX_ID, _logger, warehouse_client, corpus_name):
+    if DEPLOYED_INDEX_ID is None:
+        _logger.info(f"Creating a net new index: {INDEX_DISPLAY_NAME}")
+        # Creates index for the corpus.
+        index_name = vod_corpus.index_corpus(
+            warehouse_client, corpus_name, INDEX_DISPLAY_NAME
+        )
+        # Creates index endpoint and deploys the created index above to the index
+        # endpoint.
+        _logger.info(f"Creating a net new index endpoint: {INDEX_ENDPOINT_DISPLAY_NAME}")
+        index_endpoint_name = vod_index_endpoint.create_index_endpoint(
+            warehouse_client,
+            PROJECT_NUMBER,
+            REGION,
+            INDEX_ENDPOINT_DISPLAY_NAME,
+        ).name
+        deploy_operation = warehouse_client.deploy_index(
+            visionai_v1.DeployIndexRequest(
+                index_endpoint=index_endpoint_name,
+                deployed_index=visionai_v1.DeployedIndex(
+                    index=index_name,
+                ),
+            )
+        )
+        _logger.info("Wait for index to be deployed %s.", deploy_operation.operation.name)
+        # Wait for the deploy index operation. Depends on the data size to be
+        # indexed, the timeout may need to be increased.
+        deploy_operation.result(timeout=7200)
+        _logger.info("Index is deployed.")
+    else:
+        _logger.info(f"Using an existing index, id: {DEPLOYED_INDEX_ID}")
+        index_name = "{}/indexes/{}".format(corpus_name, DEPLOYED_INDEX_ID)
+        index = warehouse_client.get_index(visionai_v1.GetIndexRequest(name=index_name))
+        _logger.info("Use existing index %s.", index)
+        if index.state != visionai_v1.Index.State.CREATED:
+            _logger.critical("Invalid index. The index state must be Created.")
+        if not index.deployed_indexes:
+            _logger.critical("Invalid index. The index must be deployed.")
+        index_endpoint_name = index.deployed_indexes[0].index_endpoint
+    return index_name,index_endpoint_name
+
+def ingest_assets(GCS_FILES, _logger, warehouse_client, corpus_name):
+    _logger.info("Create an executor for asset uploading")
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+
+    ##########
+    # Create and ingest assets
+    new_asset_futures = []
+    for gcs_file in GCS_FILES:
+        new_asset_futures.append(
+            executor.submit(
+                vod_asset.create_and_upload_asset,
+                warehouse_client,
+                gcs_file,
+                corpus_name,
+            )
+        )
+    done_or_error, _ = concurrent.futures.wait(
+        new_asset_futures, return_when="ALL_COMPLETED"
+    )
+    asset_names = []
+    for done_future in done_or_error:
+        try:
+            asset_names.append(done_future.result())
+            _logger.info("Create and upload asset succeeded %s", done_future.result())
+        except Exception as e:
+            _logger.exception(e)
+    return executor,asset_names
+
+def create_corpus(PROJECT_NUMBER_STR, PROJECT_NUMBER, REGION, CORPUS_DISPLAY_NAME, CORPUS_DESCRIPTION, CORPUS_ID, _logger, warehouse_client):
+    if CORPUS_ID is None:
+        _logger.info(f"Create a net new corpus: {CORPUS_DISPLAY_NAME}")
+        corpus_name = vod_corpus.create_corpus(
+            warehouse_client,
+            PROJECT_NUMBER,
+            REGION,
+            CORPUS_DISPLAY_NAME,
+            CORPUS_DESCRIPTION,
+        ).name
+    else:
+        corpus_name = visionai_v1.WarehouseClient.corpus_path(
+            PROJECT_NUMBER_STR, REGION, CORPUS_ID
+        )
+        _logger.info(f"Using a preexisting corpus: {corpus_name}")
+    return corpus_name
+
+def create_vw_client(ENV, _logger):
+    _logger.info("Create a warehouse client")
+    warehouse_endpoint = channel.get_warehouse_service_endpoint(channel.Environment[ENV])
+    warehouse_client = visionai_v1.WarehouseClient(
+        client_options={"api_endpoint": warehouse_endpoint}
+    )
+    
+    return warehouse_client
+
 def main(args):
 
     ##########
@@ -92,62 +261,19 @@ def main(args):
 
     ##########
     # Create a warehouse client
-    _logger.info("Create a warehouse client")
-    warehouse_endpoint = channel.get_warehouse_service_endpoint(channel.Environment[ENV])
-    warehouse_client = visionai_v1.WarehouseClient(
-        client_options={"api_endpoint": warehouse_endpoint}
-    )
+    warehouse_client = create_vw_client(ENV, _logger)
 
     
 
     ##########
     # Create or reuse a Corpus
-    if CORPUS_ID is None:
-        _logger.info(f"Create a net new corpus: {CORPUS_DISPLAY_NAME}")
-        corpus_name = vod_corpus.create_corpus(
-            warehouse_client,
-            PROJECT_NUMBER,
-            REGION,
-            CORPUS_DISPLAY_NAME,
-            CORPUS_DESCRIPTION,
-        ).name
-    else:
-        corpus_name = visionai_v1.WarehouseClient.corpus_path(
-            PROJECT_NUMBER_STR, REGION, CORPUS_ID
-        )
-        _logger.info(f"Using a preexisting corpus: {corpus_name}")
+    corpus_name = create_corpus(PROJECT_NUMBER_STR, PROJECT_NUMBER, REGION, CORPUS_DISPLAY_NAME, CORPUS_DESCRIPTION, CORPUS_ID, _logger, warehouse_client)
 
     
 
     ##########
     # Create an executor to upload and transform assets in parallel.
-    _logger.info("Create an executor for asset uploading")
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
-
-    
-
-    ##########
-    # Create and ingest assets
-    new_asset_futures = []
-    for gcs_file in GCS_FILES:
-        new_asset_futures.append(
-            executor.submit(
-                vod_asset.create_and_upload_asset,
-                warehouse_client,
-                gcs_file,
-                corpus_name,
-            )
-        )
-    done_or_error, _ = concurrent.futures.wait(
-        new_asset_futures, return_when="ALL_COMPLETED"
-    )
-    asset_names = []
-    for done_future in done_or_error:
-        try:
-            asset_names.append(done_future.result())
-            _logger.info("Create and upload asset succeeded %s", done_future.result())
-        except Exception as e:
-            _logger.exception(e)
+    executor, asset_names = ingest_assets(GCS_FILES, _logger, warehouse_client, corpus_name)
 
     
 
@@ -155,89 +281,13 @@ def main(args):
     # *** INDEX CREATION CAN TAKE A LONG TIME ***
     # Create index and index endpoint for the corpus, or use existing index
     # and index endpoint if specified.
-    if DEPLOYED_INDEX_ID is None:
-        _logger.info(f"Creating a net new index: {INDEX_DISPLAY_NAME}")
-        # Creates index for the corpus.
-        index_name = vod_corpus.index_corpus(
-            warehouse_client, corpus_name, INDEX_DISPLAY_NAME
-        )
-        # Creates index endpoint and deploys the created index above to the index
-        # endpoint.
-        _logger.info(f"Creating a net new index endpoint: {INDEX_ENDPOINT_DISPLAY_NAME}")
-        index_endpoint_name = vod_index_endpoint.create_index_endpoint(
-            warehouse_client,
-            PROJECT_NUMBER,
-            REGION,
-            INDEX_ENDPOINT_DISPLAY_NAME,
-        ).name
-        deploy_operation = warehouse_client.deploy_index(
-            visionai_v1.DeployIndexRequest(
-                index_endpoint=index_endpoint_name,
-                deployed_index=visionai_v1.DeployedIndex(
-                    index=index_name,
-                ),
-            )
-        )
-        _logger.info("Wait for index to be deployed %s.", deploy_operation.operation.name)
-        # Wait for the deploy index operation. Depends on the data size to be
-        # indexed, the timeout may need to be increased.
-        deploy_operation.result(timeout=7200)
-        _logger.info("Index is deployed.")
-    else:
-        _logger.info(f"Using an existing index, id: {DEPLOYED_INDEX_ID}")
-        index_name = "{}/indexes/{}".format(corpus_name, DEPLOYED_INDEX_ID)
-        index = warehouse_client.get_index(visionai_v1.GetIndexRequest(name=index_name))
-        _logger.info("Use existing index %s.", index)
-        if index.state != visionai_v1.Index.State.CREATED:
-            _logger.critical("Invalid index. The index state must be Created.")
-        if not index.deployed_indexes:
-            _logger.critical("Invalid index. The index must be deployed.")
-        index_endpoint_name = index.deployed_indexes[0].index_endpoint
+    index_name, index_endpoint_name = create_index(PROJECT_NUMBER, REGION, INDEX_DISPLAY_NAME, INDEX_ENDPOINT_DISPLAY_NAME, DEPLOYED_INDEX_ID, _logger, warehouse_client, corpus_name)
     
     
 
     ##########
     # Run Transforms
-    _logger.info(f"Run transforms")
-    ocr_config = ocr_transformer.OcrTransformerInitConfig(
-        corpus_name=corpus_name,
-        env=channel.Environment[ENV],
-    )
-
-    ml_config = transformer_factory.MlTransformersCreationConfig(
-        run_embedding=True,
-        speech_transformer_init_config=speech_transformer.SpeechTransformerInitConfig(
-            corpus_name=corpus_name, language_code="en-US"
-        ),
-        ocr_transformer_init_config=ocr_config,
-    )
-    ml_transformers = transformer_factory.create_ml_transformers(
-        warehouse_client, ml_config
-    )
-    # Creates indexing transformer to index assets.
-    asset_indexing_transformer = ait.AssetIndexingTransformer(warehouse_client, index_name)
-    # Runs the transformers for the assets.
-    futures = []
-
-    for asset_name in asset_names:
-        futures.append(
-            executor.submit(
-                vod_asset.transform_single_asset,
-                asset_name,
-                ml_transformers,
-                asset_indexing_transformer,
-            )
-        )
-    done_or_error, _ = concurrent.futures.wait(futures, return_when="ALL_COMPLETED")
-    for future in done_or_error:
-        try:
-            future.result()
-        except Exception as e:
-            _logger.exception(e)
-
-    all_transformers = ml_transformers + [asset_indexing_transformer] # type: ignore
-    for transformer in all_transformers:
-        transformer.teardown()
+    run_transforms(ENV, _logger, warehouse_client, corpus_name, executor, asset_names, index_name)
 
     
 
@@ -296,36 +346,7 @@ def main(args):
 
     ##########
     # Perform clean up if requested
-    _logger.info(f"Perform clean up if requested")
-    if CLEAN_UP_ASSETS:
-        _logger.info(f"Cleaning assets")
-        for asset_name in asset_names:
-            warehouse_client.delete_asset(visionai_v1.DeleteAssetRequest(name=asset_name))
-            _logger.info("Deleted asset %s", asset_name)
-
-    if CLEAN_UP_INDEX:
-        _logger.info(f"Cleaning indices")
-        undeploy_operation = warehouse_client.undeploy_index(
-            visionai_v1.UndeployIndexRequest(index_endpoint=index_endpoint_name)
-        )
-        _logger.info(
-            "Wait for index to be undeployed %s.",
-            undeploy_operation.operation.name,
-        )
-        # Wait for the undeploy index operation.
-        undeploy_operation.result(timeout=1800)
-        _logger.info("Index is undeployed.")
-        warehouse_client.delete_index(visionai_v1.DeleteIndexRequest(name=index_name))
-        _logger.info("Deleted index %s", index_name)
-        warehouse_client.delete_index_endpoint(
-            visionai_v1.DeleteIndexEndpointRequest(name=index_endpoint_name)
-        )
-        _logger.info("Deleted index endpoint %s", index_endpoint_name)
-
-    if CLEAN_UP_CORPUS:
-        _logger.info(f"Cleaning corpus")
-        warehouse_client.delete_corpus(visionai_v1.DeleteCorpusRequest(name=corpus_name))
-        _logger.info("Deleted corpus %s", corpus_name)
+    cleanup(CLEAN_UP_ASSETS, CLEAN_UP_INDEX, CLEAN_UP_CORPUS, _logger, warehouse_client, corpus_name, asset_names, index_name, index_endpoint_name)
 
 
 if __name__ == "__main__":
